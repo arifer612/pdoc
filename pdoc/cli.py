@@ -14,7 +14,7 @@ import warnings
 from contextlib import contextmanager
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Union, Tuple
 from warnings import warn
 
 import pdoc
@@ -34,8 +34,8 @@ aa(
     metavar='MODULE',
     nargs="+",
     help="The Python module name. This may be an import path resolvable in "
-    "the current environment, or a file path to a Python module or "
-    "package.",
+         "the current environment, or a file path to a Python module or "
+         "package.",
 )
 aa(
     "-c", "--config",
@@ -61,6 +61,25 @@ aa(
     "-f", "--force",
     action="store_true",
     help="Overwrite any existing generated (--output-dir) files.",
+)
+aa(
+    "-u", "--unsorted",
+    action="store_true",
+    default=False,
+    help="Modules are not sorted alphabetically. The order used in the command"
+         "line will be used instead."
+)
+aa(
+    '-d', '--depth',
+    type=int,
+    default=1,
+    help="Depth to search for modules."
+)
+aa(
+    '-i', '--ignore',
+    type=str,
+    nargs='*',
+    help='List of modules or directories to ignore, besides the default.'
 )
 mode_aa(
     "--html",
@@ -152,6 +171,91 @@ aa(
 args = argparse.Namespace()
 
 
+def getPackages(packages: Union[str, List[str]], depth: int = 1, **kwargs) \
+        -> Tuple[List[Tuple[str, List[pdoc.Module]]], List[pdoc.Module]]:
+    """
+    Scans directories one level at a time for the presence of packages or modules.
+
+    Args:
+        packages (str, list): List of directories to packages or modules.
+        depth (int):          Number of levels deep to search.
+        kwargs:               Additional keyword arguments for pdoc.Module()
+
+    Returns:
+        Packages: The name of the package and its modules.
+        Modules:  The list of modules that do not belong to a package.
+
+    Raises:
+        ImportError:         If some of the dependencies of a module or package has not
+                             been installed into the current virtual environment.
+        ModuleNotFoundError: If no modules or packages exist even after searching through
+                             the number of levels in depth.
+        FileNotFoundError:   If one of the package directories provided does not exist.
+    """
+
+    from os import walk, listdir
+    from os.path import abspath, expanduser, join, isdir, split
+
+    def _check_if_module(module: Union[str, pdoc.Module]) -> bool:
+        if isinstance(module, str):
+            module = pdoc.import_module(module)
+            if '__file__' in dir(module):
+                return True
+            return False
+        else:
+            raise ImportError(f"{module} is not a module or package")
+
+    def _check_if_package(directory: str) -> Tuple[List[pdoc.Module], bool, List[str]]:
+        if not isinstance(directory, str):
+            raise AssertionError("Directory has to be a string")
+        directory = abspath(expanduser(directory))
+        SKIP_DIRS = ['venv', 'docs', 'egg-info', 'build', 'dist', 'virtualenv']
+        if args.ignore:
+            SKIP_DIRS += args.ignore
+        if args.output_dir:
+            SKIP_DIRS.append(args.output_dir)
+        SKIP_PREPEND = ['.', '_']
+        subDirs = [join(directory, i) for i in next(walk(directory))[1]
+                   if not any(j in i for j in SKIP_DIRS) and i[0] not in SKIP_PREPEND]
+        packageMods = [pdoc.Module(i, **kwargs) for i in subDirs if _check_if_module(i)]
+        return packageMods, True if 'setup.py' in listdir(directory) else False, subDirs
+
+    if not isinstance(depth, int):
+        print("Search depth is set to 1 level")
+        depth = 1
+
+    if not isinstance(packages, list):
+        packages = [packages]
+    ori_packages = packages
+    modules, packs, subdirs, errs = [], [], [], []
+
+    while depth:
+        for package in packages:
+            if isinstance(package, str) and isdir(abspath(expanduser(package))):
+                mods, pack, subd = _check_if_package(package)
+                if pack:
+                    packs.append((split(package)[1], mods))
+                else:
+                    modules.extend(mods)
+                    subdirs.extend(subd)
+            else:
+                errs.append(str(package))
+        if not (packs or modules or subdirs):
+            raise FileNotFoundError(f"The directories {', '.join(errs)} do not exist.")
+        depth -= 1
+        packages, subdirs, errs = subdirs, [], []
+    if not (modules or packs):
+        raise ModuleNotFoundError(f"No modules or packages were found in "
+                                  f"{' ,'.join(ori_packages)}")
+    return packs, modules
+
+
+def getModules(modules: Union[str, List[str]], depth: int = 1, **kwargs) \
+        -> List[pdoc.Module]:
+    packages, Modules = getPackages(modules, depth, **kwargs)
+    return list((*[module for package in packages for module in package[1]], *Modules))
+
+
 class _WebDoc(BaseHTTPRequestHandler):
     args = None  # Set before server instantiated
     template_config = None
@@ -188,10 +292,15 @@ class _WebDoc(BaseHTTPRequestHandler):
         importlib.invalidate_caches()
         code = 200
         if self.path == "/":
+            modules = []
+            modules.extend(getModules(module)
+                           for module in self.args.modules)
             modules = [pdoc.import_module(module, reload=True)
                        for module in self.args.modules]
-            modules = sorted((module.__name__, inspect.getdoc(module))
-                             for module in modules)
+            modules = [(module.__name__, inspect.getdoc(module))
+                       for module in modules]
+            if not self.args.unsorted:
+                modules.sort()
             out = pdoc._render_template('/html.mako',
                                         modules=modules,
                                         **self.template_config)
@@ -460,7 +569,7 @@ def main(_args=None):
             raise ValueError(
                 'Error evaluating --config statement "{}". '
                 'Make sure string values are quoted?'
-                .format(config_str)
+                    .format(config_str)
             )
 
     if args.html_no_source:
@@ -534,9 +643,10 @@ def main(_args=None):
                        isinstance(obj, pdoc.Class) and f in obj.doc
                        for f in _filters)
 
-    modules = [pdoc.Module(module, docfilter=docfilter,
-                           skip_errors=args.skip_errors)
-               for module in args.modules]
+    modules = []
+    modules.extend(module for module in
+                   getModules(args.modules, docfilter=docfilter,
+                              skip_errors=args.skip_errors))
     pdoc.link_inheritance()
 
     if args.pdf:
@@ -597,7 +707,6 @@ pandoc --metadata=title:"MyProject Documentation"               \\
        --pdf-engine=xelatex --variable=mainfont:"DejaVu Sans"   \\
        --toc --toc-depth=4 --output=pdf.pdf  pdf.md\
 '''
-
 
 if __name__ == "__main__":
     main(parser.parse_args())
