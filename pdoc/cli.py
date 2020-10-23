@@ -63,13 +63,6 @@ aa(
     help="Overwrite any existing generated (--output-dir) files.",
 )
 aa(
-    "-u", "--unsorted",
-    action="store_true",
-    default=False,
-    help="Modules are not sorted alphabetically. The order used in the command"
-         "line will be used instead."
-)
-aa(
     '-d', '--depth',
     type=int,
     default=1,
@@ -210,14 +203,23 @@ def getPackages(packages: Union[str, List[str]], depth: int = 1, **kwargs) \
             raise AssertionError("Directory has to be a string")
         directory = abspath(expanduser(directory))
         SKIP_DIRS = ['venv', 'docs', 'egg-info', 'build', 'dist', 'virtualenv']
+        SKIP_PREPEND = ['.', '_']
         if args.ignore:
             SKIP_DIRS += args.ignore
         if args.output_dir:
             SKIP_DIRS.append(args.output_dir)
-        SKIP_PREPEND = ['.', '_']
-        subDirs = [join(directory, i) for i in next(walk(directory))[1]
-                   if not any(j in i for j in SKIP_DIRS) and i[0] not in SKIP_PREPEND]
-        packageMods = [pdoc.Module(i, **kwargs) for i in subDirs if _check_if_module(i)]
+
+        packageMods, subDirs = [], []
+        if _check_if_module(directory):
+            packageMods.append(pdoc.Module(directory, **kwargs))
+        else:
+            subDirs = [join(directory, i) for i in next(walk(directory))[1]
+                       if not any(j in i for j in SKIP_DIRS) and i[0] not in SKIP_PREPEND]
+            for dir_ in subDirs:
+                if _check_if_module(dir_):
+                    packageMods.append(pdoc.Module(dir_, **kwargs))
+                else:
+                    subDirs.append(dir_)
         return packageMods, True if 'setup.py' in listdir(directory) else False, subDirs
 
     if not isinstance(depth, int):
@@ -252,6 +254,9 @@ def getPackages(packages: Union[str, List[str]], depth: int = 1, **kwargs) \
 
 def getModules(modules: Union[str, List[str]], depth: int = 1, **kwargs) \
         -> List[pdoc.Module]:
+    """
+    Retrieves all the modules from the getPackages() method.
+    """
     packages, Modules = getPackages(modules, depth, **kwargs)
     return list((*[module for package in packages for module in package[1]], *Modules))
 
